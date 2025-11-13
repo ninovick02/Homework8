@@ -1,0 +1,266 @@
+#===================================================================
+#                       HW8: Basic Modeling Practice
+#===================================================================
+
+#---------------------Libraries-----------------------------------
+library(tidymodels)
+library(lubridate)
+library(readr)
+library(skimr)
+library(janitor)
+
+#-----------------------Data and basic prep-------------------------------------
+
+bike_data <- read_csv("https://www4.stat.ncsu.edu/~online/datasets/SeoulBikeData.csv",
+                      locale = locale(encoding="latin1"))
+
+#Number of missing data per column
+colSums(is.na(bike_data))
+
+#Number of columns and observations
+dim(bike_data)
+names(bike_data)
+
+#Saving nice names in case we need to use them later
+bike_labels <- names(bike_data)
+
+#Changing names so that manipulation is easier
+names(bike_data) <- c("date", "rented_count", "hour", "temp", "humidity", "wind_speed",
+                      "vis", "dew_temp", "solar_rad","rainfall", "snowfall", "season", 
+                      "holiday", "functioning_day")
+
+# -------------------(personal) EDA and other prep -----------------------------
+
+#convert date from character to date object
+bike_data <- bike_data |>
+  mutate(date = dmy(date))
+
+#simple numeric summaries
+num_cols <- bike_data |> select(where(is.numeric))
+skim(num_cols) #Gives numeric summary and (small) histograms
+
+#double checking that I understand what the skim histograms look like
+hist(bike_data$rented_count)
+hist(bike_data$solar_rad)
+
+#Checking uniqueness of categorical data
+cat_cols <- bike_data |> select(-names(num_cols))
+cat_cols
+cat_cols |> tabyl(season) 
+cat_cols |> tabyl(date)
+cat_cols |> tabyl(holiday) #Strata? (5% holiday)
+cat_cols |> tabyl(functioning_day) #Strata? (4% no)
+
+#Set categorical variables to factors
+bike_data <- bike_data |> 
+  mutate(across(c("season", "holiday", "functioning_day"), as.factor))
+
+#summaries of bike data (by itself and by categorical variables)
+summary(bike_data$rented_count)
+
+bike_data |> 
+  group_by(season) |>
+  summarize(
+    mean_rented = mean(rented_count),
+    median_rented = median(rented_count))
+
+bike_data |> 
+  group_by(holiday) |>
+  summarize(
+    mean_rented = mean(rented_count),
+    median_rented = median(rented_count))
+
+bike_data |> 
+  group_by(functioning_day) |>
+  summarize(
+    mean_rented = mean(rented_count),
+    median_rented = median(rented_count))
+
+# No bikes rented on non-functioning days, so taking out that column
+bike_data <- bike_data |> filter(functioning_day == "Yes")
+
+#Step 7:create new dataset to summarize across hours in a day
+bike_daily <- bike_data |>
+  group_by(date, season, holiday) |>
+  summarize(
+    across(c(rented_count, rainfall, snowfall), sum, .names = "{.col}"),
+    across(c(temp, humidity, wind_speed, vis, dew_temp, solar_rad), mean)
+  ) |> ungroup()
+
+bike_daily
+
+#Find summary statistics of all numeric variables
+num_col_daily <- bike_daily |> select(where(is.numeric))
+
+bike_daily |> summarize(across(where(is.numeric),
+                               list(mean = mean, median = median, sd = sd),
+                               na.rm = TRUE))
+
+#Too many rows there, so let's just use skim again
+skim(num_col_daily)
+
+#Finding correlations and plotting
+cor_mat <-cor(num_col_daily)
+
+cor_df <- as.data.frame(as.table(cor_mat))
+
+ggplot(cor_df, aes(Var1, Var2, fill = Freq)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "red", high = "blue", mid = "purple",
+                       midpoint = 0, limit = c(-1, 1), name = "Correlation") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+  coord_fixed() +
+  labs(x = NULL, y = NULL, title = "Correlation Heatmap")
+
+
+#Now by categorical variables
+bike_daily |> 
+  group_by(season) |>
+  summarize(
+    mean_rented = mean(rented_count),
+    median_rented = median(rented_count))
+
+bike_daily |> 
+  group_by(holiday) |>
+  summarize(
+    count = sum(rented_count),
+    mean_rented = mean(rented_count),
+    median_rented = median(rented_count))
+
+#Visualize by categorical data
+ggplot(bike_daily, aes(x = season, y = rented_count, fill = season)) +
+  geom_boxplot() +
+  labs(x = "seaon", y = "rented bike count") +
+  theme(legend.position = "none")
+
+ggplot(bike_daily, aes(x = holiday, y = rented_count, fill = holiday)) +
+  geom_boxplot() +
+  labs(x = "On a Holiday?", y = "rented bike count") +
+  theme(legend.position = "none")
+
+ggplot(bike_daily, aes(x = rented_count, fill = holiday)) +
+  geom_density(alpha = .5)
+
+ggplot(bike_daily, aes(x = rented_count, fill = season)) +
+  geom_density(alpha = .5)
+
+
+
+#----------------Split data-----------------------------------
+
+set.seed(222)
+
+data_split <- initial_split(bike_daily, prop = .75, strata = "season")
+
+#Create data frames for the two sets
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+#Create cross validation folds
+cv_folds <- vfold_cv(train_data, 10)
+
+
+#--------------Recipes---------------------------------------
+
+# First recipe
+
+recipe1 <- recipe(rented_count ~ ., data = train_data) |>
+  update_role(date, new_role = "ID") |>
+  step_date(date, features = "dow") |>
+  step_mutate(day_type = factor(if_else(as.numeric(date_dow) %in% c(1,7), "weekend", "weekday"))) |>
+  step_rm(date_dow) |>
+  step_normalize(all_numeric_predictors()) |>
+  step_dummy(all_nominal_predictors())
+
+recipe1 |> summary()
+
+# Checking for errors
+recipe1 |> 
+  prep(training = train_data) |>
+  bake(train_data)
+
+# add interaction terms as specified
+recipe2 <- 
+  recipe(rented_count ~ ., data = train_data) |>
+  update_role(date, new_role = "ID") |>
+  step_date(date, features = "dow") |>
+  step_mutate(day_type = factor(if_else(as.numeric(date_dow) %in% c(1,7), "weekend", "weekday"))) |>
+  step_rm(date_dow) |>
+  step_normalize(all_numeric_predictors()) |>
+  step_dummy(all_nominal_predictors())|>
+  step_interact(terms = ~ starts_with("holiday"):starts_with("seas")) |>
+  step_interact(terms = ~ temp:starts_with("season")) |>
+  step_interact(terms = ~ temp:rainfall)
+
+# Checking for errors
+recipe2 |> 
+  prep(training = train_data) |>
+  bake(new_data = NULL) |> names()
+
+# Add squared numeric terms. Unsure if we should also use the square interactions, but it can only over-fit the data
+recipe3 <- 
+  recipe(rented_count ~ ., data = train_data) |>
+  update_role(date, new_role = "ID") |>
+  step_date(date, features = "dow") |>
+  step_mutate(day_type = factor(if_else(as.numeric(date_dow) %in% c(1,7), "weekend", "weekday"))) |>
+  step_rm(date_dow) |>
+  step_normalize(all_numeric_predictors()) |>
+  step_poly(all_numeric_predictors(), degree = 2) |>
+  step_dummy(all_nominal_predictors())|>
+  step_interact(terms = ~ starts_with("holiday"):starts_with("seas")) |>
+  step_interact(terms = ~ starts_with("temp"):starts_with("season")) |>
+  step_interact(terms = ~ starts_with("temp"):starts_with("rainfall")) 
+
+recipe3 |> 
+  prep(training = train_data) |>
+  bake(new_data = train_data) |> names()
+
+#-----------------Model Fit with LM------------------------
+
+#model
+lm_mod <- linear_reg() |>
+  set_engine("lm")
+
+#Workflows
+wf1 <- workflow() |>
+  add_model(lm_mod) |>
+  add_recipe(recipe1)
+
+wf2 <- workflow() |>
+  add_model(lm_mod) |>
+  add_recipe(recipe2)
+
+wf3 <- workflow() |>
+  add_model(lm_mod) |>
+  add_recipe(recipe3)
+
+#Fits with CV
+#Defining metrics bc fit takes **forever** on my laptop (I had to use my mom's for the tutorial)
+cv_fit1 <- wf1 |>
+  fit_resamples(resamples = cv_folds,
+                metrics = metric_set(rmse))
+
+cv_fit2 <- wf2 |>
+  fit_resamples(resamples = cv_folds,
+                metrics = metric_set(rmse))
+
+cv_fit3 <- wf3 |>
+  fit_resamples(resamples = cv_folds,
+                metrics = metric_set(rmse))
+                
+
+#Getting metrics          RMSE
+collect_metrics(cv_fit1) # 4267
+collect_metrics(cv_fit2) # 3032
+collect_metrics(cv_fit3) # 8173
+
+
+#Finalize model with full dataset
+best_fit <- wf2 |>
+  last_fit(data_split) 
+
+best_fit |> collect_metrics() #RMSE = 3115
+
+coefficient_of_fit <- best_fit |> extract_fit_parsnip() |> tidy()
+coefficient_of_fit
